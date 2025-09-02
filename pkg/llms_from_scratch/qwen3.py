@@ -5,6 +5,7 @@
 
 import os
 import json
+import re
 import urllib.request
 from pathlib import Path
 
@@ -21,7 +22,7 @@ QWEN_CONFIG_06_B = {
     "n_layers": 28,                  # Number of layers
     "hidden_dim": 3072,              # Size of the intermediate dimension in FeedForward
     "head_dim": 128,                 # Size of the heads in GQA
-    "qk_norm": True,                 # Whether to normalize queries and values in GQA
+    "qk_norm": True,                 # Whether to normalize queries and keys in GQA
     "n_kv_groups": 8,                # Key-Value groups for grouped-query attention
     "rope_base": 1_000_000.0,        # The base in RoPE's "theta"
     "dtype": torch.bfloat16,         # Lower-precision dtype to reduce memory usage
@@ -101,6 +102,23 @@ QWEN3_CONFIG_32B = {
         "dtype": torch.bfloat16,
 }
 
+# Mixture of Experts Model
+QWEN3_CONFIG_30B_A3B = {
+    "vocab_size": 151_936,
+    "context_length": 262_144,
+    "emb_dim": 2048,
+    "n_heads": 32,
+    "n_layers": 48,
+    "head_dim": 128,
+    "qk_norm": True,
+    "n_kv_groups": 4,
+    "rope_base": 10_000_000.0,
+    "dtype": torch.bfloat16,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 768,
+}
+
 
 class Qwen3Model(nn.Module):
     def __init__(self, cfg):
@@ -115,7 +133,7 @@ class Qwen3Model(nn.Module):
         self.final_norm = RMSNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
-        # Reusuable utilities
+        # Reusable utilities
         if cfg["head_dim"] is None:
             head_dim = cfg["emb_dim"] // cfg["n_heads"]
         else:
@@ -155,7 +173,10 @@ class TransformerBlock(nn.Module):
             qk_norm=cfg["qk_norm"],
             dtype=cfg["dtype"]
         )
-        self.ff = FeedForward(cfg)
+        if "num_experts" in cfg and cfg["num_experts"] > 0:
+            self.ff = MoEFeedForward(cfg)
+        else:
+            self.ff = FeedForward(cfg)
         self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
         self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
 
@@ -187,6 +208,46 @@ class FeedForward(nn.Module):
         x_fc2 = self.fc2(x)
         x = nn.functional.silu(x_fc1) * x_fc2
         return self.fc3(x)
+
+
+class MoEFeedForward(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.num_experts_per_tok = cfg["num_experts_per_tok"]
+        self.num_experts = cfg["num_experts"]
+        self.gate = nn.Linear(cfg["emb_dim"], cfg["num_experts"], bias=False, dtype=cfg["dtype"])
+
+        meta_device = torch.device("meta")  # to reduce memory pressure and only load them when used (trades compute for memory)
+        self.fc1 = nn.ModuleList([nn.Linear(cfg["emb_dim"], cfg["moe_intermediate_size"], bias=False, dtype=cfg["dtype"], device=meta_device)
+                                  for _ in range(cfg["num_experts"])])
+        self.fc2 = nn.ModuleList([nn.Linear(cfg["emb_dim"], cfg["moe_intermediate_size"], bias=False, dtype=cfg["dtype"], device=meta_device)
+                                  for _ in range(cfg["num_experts"])])
+        self.fc3 = nn.ModuleList([nn.Linear(cfg["moe_intermediate_size"], cfg["emb_dim"], bias=False, dtype=cfg["dtype"], device=meta_device)
+                                  for _ in range(cfg["num_experts"])])
+
+    def forward(self, x):
+        scores = self.gate(x)  # (b, seq_len, num_experts)
+        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
+        topk_probs = torch.softmax(topk_scores, dim=-1)
+
+        expert_outputs = []
+        for e in range(self.num_experts):
+            hidden = torch.nn.functional.silu(self.fc1[e](x)) * self.fc2[e](x)
+            out = self.fc3[e](hidden)
+            expert_outputs.append(out.unsqueeze(-2))
+        expert_outputs = torch.cat(expert_outputs, dim=-2)  # (b, t, num_experts, emb_dim)
+
+        gating_probs = torch.zeros_like(scores)
+
+        for i in range(self.num_experts_per_tok):
+            indices = topk_indices[..., i:i+1]
+            prob = topk_probs[..., i:i+1]
+            gating_probs.scatter_(dim=-1, index=indices, src=prob)
+        gating_probs = gating_probs.unsqueeze(-1)  # (b, t, num_experts, 1)
+
+        # Weighted sum over experts
+        y = (gating_probs * expert_outputs).sum(dim=-2)
+        return y
 
 
 class GroupedQueryAttention(nn.Module):
@@ -380,21 +441,53 @@ def load_weights_into_qwen(model, param_config, params):
         )
 
         # Feedforward weights
-        block.ff.fc1.weight = assign(
-            block.ff.fc1.weight,
-            params[f"model.layers.{l}.mlp.gate_proj.weight"],
-            f"model.layers.{l}.mlp.gate_proj.weight"
-        )
-        block.ff.fc2.weight = assign(
-            block.ff.fc2.weight,
-            params[f"model.layers.{l}.mlp.up_proj.weight"],
-            f"model.layers.{l}.mlp.up_proj.weight"
-        )
-        block.ff.fc3.weight = assign(
-            block.ff.fc3.weight,
-            params[f"model.layers.{l}.mlp.down_proj.weight"],
-            f"model.layers.{l}.mlp.down_proj.weight"
-        )
+        if "num_experts" in param_config:
+            # Load router (gating) weights
+            block.ff.gate.weight = assign(
+                block.ff.gate.weight,
+                params[f"model.layers.{l}.mlp.gate.weight"],
+                f"model.layers.{l}.mlp.gate.weight"
+            )
+            # Load expert weights
+            for e in range(param_config["num_experts"]):
+                prefix = f"model.layers.{l}.mlp.experts.{e}"
+                block.ff.fc1[e].weight = assign(
+                    block.ff.fc1[e].weight,
+                    params[f"{prefix}.gate_proj.weight"],
+                    f"{prefix}.gate_proj.weight"
+                )
+                block.ff.fc2[e].weight = assign(
+                    block.ff.fc2[e].weight,
+                    params[f"{prefix}.up_proj.weight"],
+                    f"{prefix}.up_proj.weight"
+                )
+                block.ff.fc3[e].weight = assign(
+                    block.ff.fc3[e].weight,
+                    params[f"{prefix}.down_proj.weight"],
+                    f"{prefix}.down_proj.weight"
+                )
+                # After assigning weights, move the expert layers from meta to CPU
+                block.ff.fc1[e] = block.ff.fc1[e].to("cpu")
+                block.ff.fc2[e] = block.ff.fc2[e].to("cpu")
+                block.ff.fc3[e] = block.ff.fc3[e].to("cpu")
+
+        else:
+            block.ff.fc1.weight = assign(
+                block.ff.fc1.weight,
+                params[f"model.layers.{l}.mlp.gate_proj.weight"],
+                f"model.layers.{l}.mlp.gate_proj.weight"
+            )
+            block.ff.fc2.weight = assign(
+                block.ff.fc2.weight,
+                params[f"model.layers.{l}.mlp.up_proj.weight"],
+                f"model.layers.{l}.mlp.up_proj.weight"
+            )
+            block.ff.fc3.weight = assign(
+                block.ff.fc3.weight,
+                params[f"model.layers.{l}.mlp.down_proj.weight"],
+                f"model.layers.{l}.mlp.down_proj.weight"
+            )
+
         block.norm2.scale = assign(
             block.norm2.scale,
             params[f"model.layers.{l}.post_attention_layernorm.weight"],
@@ -404,56 +497,90 @@ def load_weights_into_qwen(model, param_config, params):
     # Final normalization and output head
     model.final_norm.scale = assign(model.final_norm.scale, params["model.norm.weight"], "model.norm.weight")
 
-    # Model uses weight tying, hence we reuse the embedding layer weights here
-    model.out_head.weight = assign(model.out_head.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
+    if "lm_head.weight" in params:
+        model.out_head.weight = assign(model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
+    else:
+        # Model uses weight tying, hence we reuse the embedding layer weights here
+        print("Model uses weight tying.")
+        model.out_head.weight = assign(model.out_head.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
 
 
-class Qwen3Tokenizer():
-    def __init__(self, tokenizer_file_path="tokenizer.json",
-                 repo_id=None, apply_chat_template=True,
-                 add_generation_prompt=False, add_thinking=False):
+class Qwen3Tokenizer:
+    _SPECIALS = [
+        "<|endoftext|>",
+        "<|im_start|>", "<|im_end|>",
+        "<|object_ref_start|>", "<|object_ref_end|>",
+        "<|box_start|>", "<|box_end|>",
+        "<|quad_start|>", "<|quad_end|>",
+        "<|vision_start|>", "<|vision_end|>",
+        "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+        "<think>", "</think>"
+    ]
+    _SPLIT_RE = re.compile(r"(<\|[^>]+?\|>|<think>|</think>)")
+
+    def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None,
+                 apply_chat_template=True, add_generation_prompt=False, add_thinking=False):
         from tokenizers import Tokenizer
-        self.tokenizer_file_path = tokenizer_file_path
+
         self.apply_chat_template = apply_chat_template
         self.add_generation_prompt = add_generation_prompt
         self.add_thinking = add_thinking
 
-        tokenizer_file_path_obj = Path(tokenizer_file_path)
-        if not tokenizer_file_path_obj.is_file() and repo_id is not None:
-            _ = download_from_huggingface(
+        tok_file = Path(tokenizer_file_path)
+        if not tok_file.is_file() and repo_id:
+            download_from_huggingface(
                 repo_id=repo_id,
-                filename=str(tokenizer_file_path_obj.name),
-                local_dir=str(tokenizer_file_path_obj.parent.name)
+                filename=tok_file.name,
+                local_dir=str(tok_file.parent),
             )
-        self.tokenizer = Tokenizer.from_file(tokenizer_file_path)
+        self._tok = Tokenizer.from_file(str(tok_file))
+        self._special_to_id = {}
+        for t in self._SPECIALS:
+            tid = self._tok.token_to_id(t)
+            if tid is not None:
+                self._special_to_id[t] = tid
 
-    def encode(self, prompt):
-        if self.apply_chat_template:
-            messages = [{"role": "user", "content": prompt}]
-            formatted_prompt = self.format_qwen_chat(
-                messages,
-                add_generation_prompt=self.add_generation_prompt,
-                add_thinking=self.add_thinking
-            )
+        self.pad_token_id = self._special_to_id["<|endoftext|>"]
+        self.eos_token_id = self.pad_token_id
+
+        if repo_id and "Base" not in repo_id:
+            eos_token = "<|im_end|>"
         else:
-            formatted_prompt = prompt
-        return self.tokenizer.encode(formatted_prompt).ids
+            eos_token = "<|endoftext|>"
+        if eos_token in self._special_to_id:
+            self.eos_token_id = self._special_to_id[eos_token]
 
-    def decode(self, token_ids):
-        return self.tokenizer.decode(token_ids, skip_special_tokens=False)
+    def encode(self, text, chat_wrapped=None):
+        if chat_wrapped is None:
+            chat_wrapped = self.apply_chat_template
 
-    @staticmethod
-    def format_qwen_chat(messages, add_generation_prompt=False, add_thinking=False):
-        prompt = ""
-        for msg in messages:
-            prompt += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
-        if add_generation_prompt:
-            prompt += "<|im_start|>assistant"
-            if add_thinking:
-                prompt += "\n"  # no <think> tags
+        stripped = text.strip()
+        if stripped in self._special_to_id and "\n" not in stripped:
+            return [self._special_to_id[stripped]]
+
+        if chat_wrapped:
+            text = self._wrap_chat(text)
+
+        ids = []
+        for part in filter(None, self._SPLIT_RE.split(text)):
+            if part in self._special_to_id:
+                ids.append(self._special_to_id[part])
             else:
-                prompt += "\n<think>\n\n</think>\n\n"
-        return prompt
+                ids.extend(self._tok.encode(part).ids)
+        return ids
+
+    def decode(self, ids):
+        return self._tok.decode(ids, skip_special_tokens=False)
+
+    def _wrap_chat(self, user_msg):
+        s = f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+        if self.add_generation_prompt:
+            s += "<|im_start|>assistant"
+            if self.add_thinking:
+                s += "\n"
+            else:
+                s += "\n<think>\n\n</think>\n\n"
+        return s
 
 
 def download_from_huggingface(repo_id, filename, local_dir, revision="main"):
